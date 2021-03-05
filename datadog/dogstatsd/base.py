@@ -13,7 +13,7 @@ import os
 import socket
 import errno
 import time
-from threading import Lock
+from threading import Lock, RLock
 
 # Datadog libraries
 from datadog.dogstatsd.context import (
@@ -183,7 +183,7 @@ class DogStatsd(object):
         :type telemetry_socket_path: string
         """
 
-        self.lock = Lock()
+        self._socket_lock = Lock()
 
         # Check for deprecated option
         if max_buffer_size is not None:
@@ -273,6 +273,9 @@ class DogStatsd(object):
         self._telemetry_flush_interval = telemetry_min_flush_interval
         self._telemetry = not disable_telemetry
 
+        self._buffer_lock = RLock()
+        self._buffer_lock_depth = 0
+
     def disable_telemetry(self):
         self._telemetry = False
 
@@ -311,7 +314,7 @@ class DogStatsd(object):
         Note: connect the socket before assigning it to the class instance to
         avoid bad thread race conditions.
         """
-        with self.lock:
+        with self._socket_lock:
             if telemetry and self._dedicated_telemetry_destination():
                 if not self.telemetry_socket:
                     if self.telemetry_socket_path is not None:
@@ -352,7 +355,16 @@ class DogStatsd(object):
         >>> with DogStatsd() as batch:
         >>>     batch.gauge("users.online", 123)
         >>>     batch.gauge("active.connections", 1001)
+
+        Note: This method must be called before close_buffer() matching invocation.
         """
+
+        # We use an RLock which allows the same thread to re-enter a lock. To
+        # ensure that all the locks are properly released, we need to keep track
+        # of how many `RLock.acquire()` we called from the same thread.
+        self._buffer_lock.acquire()
+        self._buffer_lock_depth += 1
+
         if max_buffer_size is not None:
             log.warning("The parameter max_buffer_size is now deprecated and is not used anymore")
         self._current_buffer_total_size = 0
@@ -362,15 +374,25 @@ class DogStatsd(object):
     def close_buffer(self):
         """
         Flush the buffer and switch back to single metric packets.
+
+        Note: This method must be called after a matching open_buffer()
+        invocation.
         """
-        if not hasattr(self, 'buffer'):
-            raise BufferError('Cannot close buffer that was never opened')
 
-        self._send = self._send_to_server
+        try:
+            if not hasattr(self, 'buffer'):
+                raise BufferError('Cannot close buffer that was never opened')
 
-        if self.buffer:
-            # Only send packets if there are packets to send
-            self._flush_buffer()
+            self._send = self._send_to_server
+
+            if self.buffer:
+                # Only send packets if there are packets to send
+                self._flush_buffer()
+        finally:
+            # Release all locks that might have been held by our thread.
+            while self._buffer_lock_depth > 0:
+                self._buffer_lock_depth -= 1
+                self._buffer_lock.release()
 
     def gauge(
         self,
@@ -509,7 +531,7 @@ class DogStatsd(object):
         """
         Closes connected socket if connected.
         """
-        with self.lock:
+        with self._socket_lock:
             if self.socket:
                 try:
                     self.socket.close()
